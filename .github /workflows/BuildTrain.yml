@@ -1,0 +1,252 @@
+name: Build Train
+on:
+  # on every monday at 3:30
+  schedule:
+    - cron:  '30 3 * * 1'
+
+  # build a new release on push a new config file
+  push:
+    branches:
+      - "main"
+    paths:
+      - "configs/*"
+
+  # enable manual start of this workflow
+  workflow_dispatch:
+
+# Allow to stop obsolete workflows
+concurrency:
+  group: ci-buildtrain-release-${{ github.ref }}-1
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    name: Create Matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Create Matrix Armbian
+        id: set-matrix-armbian
+        run: |
+          JSON=$(find ${{ github.workspace }}/configs -type f -name "board-*.conf" -printf '%f\n' | sed 's#board-##;s#.conf##' | jq -R -s -c 'split("\n")[:-1]')
+          echo "configfiles=${JSON}" >> $GITHUB_OUTPUT
+          echo "::group::Matrix Armbian"
+          echo "${JSON}"
+          echo "::endgroup::"
+
+      - name: Create Matrix OrangePi
+        id: set-matrix-orangepi
+        run: |
+          JSON=$(find ${{ github.workspace }}/configs-orangepi -type f -name "board-*.conf" -printf '%f\n' | sed 's#board-##;s#.conf##' | jq -R -s -c 'split("\n")[:-1]')
+          echo "configfiles=${JSON}" >> $GITHUB_OUTPUT
+          echo "::group::Matrix OrangePi"
+          echo "${JSON}"
+          echo "::endgroup::"
+
+    outputs:
+      configfiles-armbian: ${{ steps.set-matrix-armbian.outputs.configfiles }}
+      configfiles-orangepi: ${{ steps.set-matrix-orangepi.outputs.configfiles }}
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.release.outputs.id }}
+      tag_name: ${{ steps.time.outputs.time }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          path: build-configs
+
+      - name: Read configs
+        id: config
+        shell: bash
+        run: |
+          source ./build-configs/configs/config-default.conf
+          
+          echo "armbian_repository=${ARMBIAN_REPOSITORY}" >> $GITHUB_OUTPUT
+          echo "armbian_branch=${ARMBIAN_BRANCH}" >> $GITHUB_OUTPUT
+
+      - name: Checkout armbian Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          repository: ${{ steps.config.outputs.armbian_repository }}
+          ref: ${{ steps.config.outputs.armbian_branch }}
+          path: build
+
+      - name: Get armbian version
+        id: armbian-version
+        run: |
+          VERSION=$(cat ./build/VERSION)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Get time
+        id: time
+        uses: nanzm/get-time-action@v1.1
+        with:
+          format: 'YYYYMMDD-HHmm'
+
+      - name: Create empty release
+        id: release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ${{ steps.armbian-version.outputs.version }}-${{ steps.time.outputs.time }}
+          tag_name: ${{ steps.time.outputs.time }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: true
+
+  build-armbian:
+    name: Armbian
+    needs: [setup, release]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        configfile: ${{ fromJson(needs.setup.outputs.configfiles-armbian) }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: Build image
+        uses: ./actions/build-image
+        with:
+          configfile: ${{ matrix.configfile }}
+
+      - name: Rename Files
+        run: |
+          WORKSPACE=$(echo ${{ github.workspace }})
+          cd $WORKSPACE/build/output/images/
+          mv *.img armbian-${{ matrix.configfile }}.img
+          mv *.txt armbian-${{ matrix.configfile }}.txt
+
+      - name: Compressing Image
+        run: |
+          WORKSPACE=$(echo ${{ github.workspace }})
+          cd $WORKSPACE/build/output/images/
+          xz -efkvz armbian-${{ matrix.configfile }}.img || true
+
+      - name: Calculating checksums
+        run: |
+          WORKSPACE=$(echo ${{ github.workspace }})
+          cd $WORKSPACE/build/output/images/
+          sha256sum armbian-${{ matrix.configfile }}.img > armbian-${{ matrix.configfile }}.img.sha256
+          sha256sum armbian-${{ matrix.configfile }}.img.xz > armbian-${{ matrix.configfile }}.img.xz.sha256
+
+      - name: Upload Image to Release
+        if: needs.release.outputs.id != ''
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          release_id: ${{ needs.release.outputs.id }}
+          file: ./build/output/images/*.img.xz
+          draft: true
+
+      - name: Upload Checksum to Release
+        if: needs.release.outputs.id != ''
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          release_id: ${{ needs.release.outputs.id }}
+          file: ./build/output/images/*.sha256
+          draft: true
+
+      - name: Upload Config to Release
+        if: needs.release.outputs.id != ''
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          release_id: ${{ needs.release.outputs.id }}
+          file: ./build/output/images/*.txt
+          draft: true
+
+  build-orangepi:
+    name: Orangepi
+    needs: [ setup, release ]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        configfile: ${{ fromJson(needs.setup.outputs.configfiles-orangepi) }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: Build image
+        uses: ./actions/build-orangepi-image
+        with:
+          configfile: ${{ matrix.configfile }}
+
+      - name: Rename Files
+        run: |
+          WORKSPACE=$(echo ${{ github.workspace }})
+          cd $WORKSPACE/build/output/images/
+          mv */*.img ./orangepi-${{ matrix.configfile }}.img
+
+      - name: Compressing Image
+        run: |
+          WORKSPACE=$(echo ${{ github.workspace }})
+          cd $WORKSPACE/build/output/images/
+          xz -efkvz orangepi-${{ matrix.configfile }}.img || true
+
+      - name: Calculating checksums
+        run: |
+          WORKSPACE=$(echo ${{ github.workspace }})
+          cd $WORKSPACE/build/output/images/
+          sha256sum orangepi-${{ matrix.configfile }}.img > orangepi-${{ matrix.configfile }}.img.sha256
+          sha256sum orangepi-${{ matrix.configfile }}.img.xz > orangepi-${{ matrix.configfile }}.img.xz.sha256
+
+      - name: Upload Image to Release
+        if: needs.release.outputs.id != ''
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          release_id: ${{ needs.release.outputs.id }}
+          file: ./build/output/images/*.img.xz
+          draft: true
+
+      - name: Upload Checksum to Release
+        if: needs.release.outputs.id != ''
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          release_id: ${{ needs.release.outputs.id }}
+          file: ./build/output/images/*.sha256
+          draft: true
+
+  finish:
+    name: Finish BuildTrain
+    needs: [release, build-armbian, build-orangepi]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish Release
+        uses: StuYarrow/publish-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          id: ${{ needs.release.outputs.id }}
+
+  cleanup:
+    name: Cleanup BuildTrain
+    needs: [release, build-armbian, build-orangepi]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete drafts
+        uses: hugo19941994/delete-draft-releases@v1.0.0
+        with:
+          threshold: 2d
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
